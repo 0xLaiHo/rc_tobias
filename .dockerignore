@@ -1,0 +1,9 @@
+.git
+.codex
+.agents
+tmp
+bin
+*.db
+*.log
+.env
+.env.*

@@ -1,0 +1,73 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: notify
+      POSTGRES_PASSWORD: notify
+      POSTGRES_DB: notify
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U notify -d notify"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - redis-data:/data
+
+  api:
+    build: .
+    command: ["/app/api"]
+    environment:
+      RC_NOTIFY_ADDR: ":8080"
+      RC_NOTIFY_DATABASE_URL: "postgres://notify:notify@postgres:5432/notify?sslmode=disable"
+      RC_NOTIFY_REDIS_ADDR: "redis:6379"
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  relay:
+    build: .
+    command: ["/app/relay"]
+    environment:
+      RC_NOTIFY_DATABASE_URL: "postgres://notify:notify@postgres:5432/notify?sslmode=disable"
+      RC_NOTIFY_REDIS_ADDR: "redis:6379"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker:
+    build: .
+    command: ["/app/worker"]
+    environment:
+      RC_NOTIFY_DATABASE_URL: "postgres://notify:notify@postgres:5432/notify?sslmode=disable"
+      RC_NOTIFY_REDIS_ADDR: "redis:6379"
+      RC_NOTIFY_WORKERS: "2"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+volumes:
+  postgres-data:
+  redis-data:

@@ -134,7 +134,58 @@ make ssrf-test
 
 ## API
 
-### 创建通知
+API 面向内部业务系统和运维人员。所有请求和响应均使用 JSON；时间字段为 RFC3339 格式。
+
+### 接口概览
+
+| 方法 | 路径 | 说明 | 成功状态码 |
+| --- | --- | --- | --- |
+| `GET` | `/healthz` | 进程存活检查。 | `200` |
+| `GET` | `/readyz` | 依赖就绪检查，验证 PostgreSQL 和 Redis 可用。 | `200` |
+| `POST` | `/notifications` | 创建一条外部 HTTP 通知任务。 | `202` |
+| `GET` | `/notifications/{id}` | 查询通知任务状态。 | `200` |
+| `GET` | `/notifications/{id}/attempts` | 查询通知任务的投递尝试历史。 | `200` |
+| `POST` | `/notifications/{id}/retry` | 对 `failed` 任务执行人工重新入队。 | `202` |
+
+错误响应统一格式：
+
+```json
+{
+  "error": "invalid notification request: max_attempts must be between 1 and 20"
+}
+```
+
+常见错误码：
+
+| 状态码 | 场景 |
+| --- | --- |
+| `400` | JSON 非法、通知 ID 非 UUID、请求字段校验失败、目标 URL 被 SSRF 规则拒绝。 |
+| `404` | 通知任务不存在。 |
+| `409` | 当前状态不允许该操作，例如对非 `failed` 任务调用 retry。 |
+| `500` | 服务端内部错误。 |
+| `503` | `/readyz` 检查依赖不可用。 |
+
+通知状态：
+
+| 状态 | 含义 |
+| --- | --- |
+| `pending` | 任务已持久化，等待 relay 发布或等待 worker 消费。 |
+| `delivering` | worker 正在执行一次 HTTP 投递。 |
+| `retrying` | 本次投递失败，已安排下一次重试。 |
+| `succeeded` | 外部 HTTP API 返回 2xx，任务完成。 |
+| `failed` | 不可重试错误或达到 `max_attempts`，等待人工补偿。 |
+
+### 创建通知：`POST /notifications`
+
+请求字段：
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `url` | string | 是 | 外部供应商 HTTP(S) 地址，必须是绝对 URL，只允许 `http`/`https`，且不能解析到内部网络地址。 |
+| `method` | string | 否 | HTTP 方法，默认 `POST`，仅允许 `POST`、`PUT`、`PATCH`。 |
+| `headers` | object | 否 | 透传给外部供应商的请求头。Header name 必须合法，Header value 不能包含换行。 |
+| `body` | JSON | 否 | 透传给外部供应商的 JSON body，最大 256 KiB。 |
+| `max_attempts` | integer | 否 | 最大投递次数，默认 `5`，范围 `1` 到 `20`。 |
 
 ```bash
 curl -X POST http://localhost:8080/notifications \
@@ -148,22 +199,115 @@ curl -X POST http://localhost:8080/notifications \
   }'
 ```
 
-返回 `202 Accepted`。
+返回 `202 Accepted`：
 
-### 查询状态
+```json
+{
+  "id": "b3f86dd9-b06d-4b63-9d7f-bcdfd7d27628",
+  "url": "https://vendor.example/hooks",
+  "method": "POST",
+  "headers": {
+    "Content-Type": "application/json"
+  },
+  "body": {
+    "event": "registered",
+    "user_id": "u_123"
+  },
+  "status": "pending",
+  "attempt_count": 0,
+  "max_attempts": 5,
+  "created_at": "2026-06-28T20:19:07.419052Z",
+  "updated_at": "2026-06-28T20:19:07.419052Z"
+}
+```
+
+### 查询通知：`GET /notifications/{id}`
 
 ```bash
 curl http://localhost:8080/notifications/{id}
+```
+
+返回 `200 OK`：
+
+```json
+{
+  "id": "b3f86dd9-b06d-4b63-9d7f-bcdfd7d27628",
+  "url": "https://vendor.example/hooks",
+  "method": "POST",
+  "headers": {
+    "Content-Type": "application/json"
+  },
+  "body": {
+    "event": "registered",
+    "user_id": "u_123"
+  },
+  "status": "succeeded",
+  "attempt_count": 1,
+  "max_attempts": 5,
+  "created_at": "2026-06-28T20:19:07.419052Z",
+  "updated_at": "2026-06-28T20:19:08.302045Z"
+}
+```
+
+失败或等待重试时，响应可能包含：
+
+- `last_error`：最近一次错误。
+- `next_attempt_at`：下一次重试时间。
+
+### 查询尝试历史：`GET /notifications/{id}/attempts`
+
+```bash
 curl http://localhost:8080/notifications/{id}/attempts
 ```
 
-### 人工补偿
+返回 `200 OK`：
+
+```json
+{
+  "attempts": [
+    {
+      "id": "fb61bcb9-28b0-44b8-9c97-8234ce731222",
+      "notification_id": "b3f86dd9-b06d-4b63-9d7f-bcdfd7d27628",
+      "attempt_number": 1,
+      "status": "succeeded",
+      "http_status": 200,
+      "duration_ms": 833,
+      "created_at": "2026-06-28T20:19:08.303355Z"
+    }
+  ]
+}
+```
+
+失败尝试会包含 `error_message`，例如：
+
+```json
+{
+  "attempt_number": 1,
+  "status": "failed",
+  "http_status": 500,
+  "error_message": "unexpected HTTP status 500",
+  "duration_ms": 194
+}
+```
+
+### 人工补偿：`POST /notifications/{id}/retry`
 
 ```bash
 curl -X POST http://localhost:8080/notifications/{id}/retry
 ```
 
-仅允许对 `failed` 任务重新入队。
+仅允许对 `failed` 任务重新入队。成功时返回 `202 Accepted`，任务状态重置为 `pending`，`attempt_count` 重置为 `0`，并写入新的 outbox 事件。
+
+如果任务不存在，返回 `404`。如果任务不是 `failed`，返回 `409`。
+
+### 健康检查
+
+```bash
+curl http://localhost:8080/healthz
+curl http://localhost:8080/readyz
+```
+
+`/healthz` 只表示进程可响应；`/readyz` 会检查 PostgreSQL 和 Redis，适合作为部署平台的 readiness probe。
 
 ## Makefile 命令
 
